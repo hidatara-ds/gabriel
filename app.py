@@ -29,6 +29,12 @@ app = Flask(__name__)
 LATEST_INPUT_WAV = None
 LATEST_INPUT_META = {}
 
+# Speech cleanup tuning (override via Cloud Run env vars if needed)
+AUDIO_HP_CUTOFF_HZ = int(os.environ.get("AUDIO_HP_CUTOFF_HZ", "220"))
+AUDIO_LP_CUTOFF_HZ = int(os.environ.get("AUDIO_LP_CUTOFF_HZ", "3400"))
+AUDIO_TARGET_DBFS = float(os.environ.get("AUDIO_TARGET_DBFS", "-24.0"))
+AUDIO_MAX_GAIN_DB = float(os.environ.get("AUDIO_MAX_GAIN_DB", "10.0"))
+
 # Inisialisasi Vertex AI
 #key_path = os.path.join(os.path.dirname(__file__), "key.json")
 #os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = key_path
@@ -295,13 +301,20 @@ def api_process_audio():
         diagnostics['decoded_rms'] = int(sound.rms)
 
         sound = sound.set_frame_rate(16000).set_channels(1).set_sample_width(2)
-        # ESP32 mic input is often very quiet; boost before STT.
+        if AUDIO_HP_CUTOFF_HZ > 0:
+            sound = sound.high_pass_filter(AUDIO_HP_CUTOFF_HZ)
+            # Second pass to reduce low-end rumble from noisy power/ground.
+            sound = sound.high_pass_filter(AUDIO_HP_CUTOFF_HZ)
+        if AUDIO_LP_CUTOFF_HZ > 0:
+            sound = sound.low_pass_filter(AUDIO_LP_CUTOFF_HZ)
+        diagnostics['hp_cutoff_hz'] = AUDIO_HP_CUTOFF_HZ
+        diagnostics['lp_cutoff_hz'] = AUDIO_LP_CUTOFF_HZ
+
+        # ESP32 mic input is often quiet; apply controlled gain before STT.
         if sound.rms > 0:
-            target_dbfs = -18.0
-            gain_db = target_dbfs - sound.dBFS
-            # Clamp gain to avoid over-amplification noise.
-            if gain_db > 30.0:
-                gain_db = 30.0
+            gain_db = AUDIO_TARGET_DBFS - sound.dBFS
+            if gain_db > AUDIO_MAX_GAIN_DB:
+                gain_db = AUDIO_MAX_GAIN_DB
             if gain_db > 1.0:
                 sound = sound.apply_gain(gain_db)
             diagnostics['applied_gain_db'] = round(float(gain_db), 2)
