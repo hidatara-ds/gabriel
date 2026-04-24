@@ -10,7 +10,7 @@
 import os
 import base64
 import json
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 import vertexai
 from vertexai.preview.generative_models import GenerativeModel
 from gtts import gTTS
@@ -26,6 +26,8 @@ import sqlite3
 from datetime import datetime
 
 app = Flask(__name__)
+LATEST_INPUT_WAV = None
+LATEST_INPUT_META = {}
 
 # Inisialisasi Vertex AI
 #key_path = os.path.join(os.path.dirname(__file__), "key.json")
@@ -221,6 +223,7 @@ from pydub import AudioSegment
 
 @app.route('/api/process-audio', methods=['POST'])
 def api_process_audio():
+    global LATEST_INPUT_WAV, LATEST_INPUT_META
     input_path = None
     converted_path = None
     diagnostics = {
@@ -315,6 +318,16 @@ def api_process_audio():
             converted_bytes = f.read()
         diagnostics['converted_bytes_len'] = len(converted_bytes)
         diagnostics['converted_ms'] = len(sound)
+        LATEST_INPUT_WAV = converted_bytes
+        LATEST_INPUT_META = {
+            'session_id': session_id,
+            'bytes': len(converted_bytes),
+            'duration_ms': len(sound),
+            'sample_rate': 16000,
+            'channels': 1,
+            'sample_width': 2,
+            'timestamp': datetime.utcnow().isoformat() + 'Z',
+        }
 
         # Kirim ke Google STT
         speech_client = speech.SpeechClient()
@@ -393,6 +406,27 @@ def api_process_audio():
                 os.remove(converted_path)
         except Exception as cleanup_err:
             print('[API] cleanup converted error:', cleanup_err)
+
+@app.route('/api/debug/latest-input-meta', methods=['GET'])
+def debug_latest_input_meta():
+    if not LATEST_INPUT_META:
+        return jsonify({'error': 'Belum ada audio input tersimpan'}), 404
+    return jsonify({
+        'status': 'ok',
+        'meta': LATEST_INPUT_META
+    })
+
+@app.route('/api/debug/latest-input-wav', methods=['GET'])
+def debug_latest_input_wav():
+    if not LATEST_INPUT_WAV:
+        return jsonify({'error': 'Belum ada audio input tersimpan'}), 404
+    return Response(
+        LATEST_INPUT_WAV,
+        mimetype='audio/wav',
+        headers={
+            'Content-Disposition': 'inline; filename=latest-input.wav'
+        }
+    )
 
 # Endpoint untuk testing API
 @app.route('/api/test', methods=['POST'])
