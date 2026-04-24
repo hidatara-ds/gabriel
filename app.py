@@ -28,6 +28,8 @@ from datetime import datetime
 app = Flask(__name__)
 LATEST_INPUT_WAV = None
 LATEST_INPUT_META = {}
+AUDIO_CACHE = {}
+AUDIO_CACHE_MAX_ITEMS = 20
 
 # Speech cleanup tuning (override via Cloud Run env vars if needed)
 AUDIO_HP_CUTOFF_HZ = int(os.environ.get("AUDIO_HP_CUTOFF_HZ", "220"))
@@ -386,20 +388,72 @@ def api_process_audio():
         # Simpan jawaban ke DB
         save_message(session_id, 'assistant', answer)
 
-        # TTS
-        synthesize_speech(answer, "temp_response.mp3")
-        with open("temp_response.mp3", "rb") as audio_file:
-            audio_base64 = base64.b64encode(audio_file.read()).decode('utf-8')
-        os.remove("temp_response.mp3")
+        user_agent = (request.user_agent.string or "") if request.user_agent else ""
+        is_esp_client = ("ESP32HTTPClient" in user_agent) or (request.headers.get("X-Client", "").lower() == "esp32")
 
-        return jsonify({
+        response_payload = {
             'question': question,
             'answer': answer,
-            'audio_base64': audio_base64,
             'session_id': session_id,
             'stage': 'ok',
             'diagnostics': diagnostics
-        })
+        }
+
+        include_audio_req = data.get('include_audio')
+        # Backward compatibility:
+        # - browser/web: include audio by default
+        # - ESP: default no inline audio
+        include_audio = (not is_esp_client) if include_audio_req is None else bool(include_audio_req)
+        audio_delivery = (data.get('audio_delivery') or "auto").lower()  # auto | inline | url | none
+
+        if audio_delivery == "auto":
+            if not include_audio:
+                audio_delivery = "none"
+            else:
+                audio_delivery = "url" if is_esp_client else "inline"
+
+        diagnostics['include_audio'] = include_audio
+        diagnostics['audio_delivery'] = audio_delivery
+
+        if include_audio and audio_delivery in ("inline", "url"):
+            synthesize_speech(answer, "temp_response.mp3")
+            with open("temp_response.mp3", "rb") as audio_file:
+                audio_bytes = audio_file.read()
+            os.remove("temp_response.mp3")
+
+            if audio_delivery == "inline":
+                audio_base64 = base64.b64encode(audio_bytes).decode('utf-8')
+                response_payload['audio_base64'] = audio_base64
+            elif audio_delivery == "url":
+                audio_id = uuid.uuid4().hex
+                AUDIO_CACHE[audio_id] = {
+                    'bytes': audio_bytes,
+                    'mime': 'audio/mpeg',
+                    'created_at': datetime.utcnow().isoformat() + 'Z',
+                }
+                # Simple bounded cache
+                while len(AUDIO_CACHE) > AUDIO_CACHE_MAX_ITEMS:
+                    oldest_key = next(iter(AUDIO_CACHE))
+                    del AUDIO_CACHE[oldest_key]
+                response_payload['audio_id'] = audio_id
+                response_payload['audio_url'] = f"/api/audio/{audio_id}"
+                response_payload['audio_mime'] = "audio/mpeg"
+
+        diagnostics['is_esp_client'] = is_esp_client
+        # Keep ESP responses minimal to avoid JSON parsing/memory issues on device.
+        if is_esp_client:
+            minimal_payload = {
+                'question': question,
+                'answer': answer,
+                'session_id': session_id,
+                'stage': 'ok'
+            }
+            if audio_delivery == "url" and 'audio_url' in response_payload:
+                minimal_payload['audio_url'] = response_payload['audio_url']
+                minimal_payload['audio_id'] = response_payload.get('audio_id')
+                minimal_payload['audio_mime'] = response_payload.get('audio_mime')
+            return jsonify(minimal_payload)
+        return jsonify(response_payload)
 
     except Exception as e:
         print('[API] ERROR:', str(e))
@@ -419,6 +473,17 @@ def api_process_audio():
                 os.remove(converted_path)
         except Exception as cleanup_err:
             print('[API] cleanup converted error:', cleanup_err)
+
+@app.route('/api/audio/<audio_id>', methods=['GET'])
+def get_cached_audio(audio_id):
+    audio_item = AUDIO_CACHE.get(audio_id)
+    if not audio_item:
+        return jsonify({'error': 'Audio tidak ditemukan atau kadaluarsa'}), 404
+    return Response(
+        audio_item['bytes'],
+        mimetype=audio_item.get('mime', 'audio/mpeg'),
+        headers={'Content-Disposition': f'inline; filename={audio_id}.mp3'}
+    )
 
 @app.route('/api/debug/latest-input-meta', methods=['GET'])
 def debug_latest_input_meta():
