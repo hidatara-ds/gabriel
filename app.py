@@ -288,8 +288,25 @@ def api_process_audio():
         diagnostics['decoded_channels'] = sound.channels
         diagnostics['decoded_frame_rate'] = sound.frame_rate
         diagnostics['decoded_sample_width'] = sound.sample_width
+        diagnostics['decoded_dbfs'] = float(sound.dBFS) if sound.dBFS != float("-inf") else -999.0
+        diagnostics['decoded_rms'] = int(sound.rms)
 
         sound = sound.set_frame_rate(16000).set_channels(1).set_sample_width(2)
+        # ESP32 mic input is often very quiet; boost before STT.
+        if sound.rms > 0:
+            target_dbfs = -18.0
+            gain_db = target_dbfs - sound.dBFS
+            # Clamp gain to avoid over-amplification noise.
+            if gain_db > 30.0:
+                gain_db = 30.0
+            if gain_db > 1.0:
+                sound = sound.apply_gain(gain_db)
+            diagnostics['applied_gain_db'] = round(float(gain_db), 2)
+        else:
+            diagnostics['applied_gain_db'] = 0.0
+
+        diagnostics['post_gain_dbfs'] = float(sound.dBFS) if sound.dBFS != float("-inf") else -999.0
+        diagnostics['post_gain_rms'] = int(sound.rms)
         temp_converted = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
         sound.export(temp_converted.name, format="wav")
         converted_path = temp_converted.name
