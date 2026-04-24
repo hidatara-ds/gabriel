@@ -1,6 +1,22 @@
+# Python
 __pycache__/
 *.pyc
+*.pyo
 .venv/
+
+# Environment
 .env
+.env.local
+
+# Git / Docs
 .git
 .gitignore
+README.md
+
+# Docker
+Dockerfile
+.dockerignore
+
+# IDE
+.vscode/
+.idea/
