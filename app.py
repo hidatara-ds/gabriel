@@ -221,34 +221,74 @@ from pydub import AudioSegment
 
 @app.route('/api/process-audio', methods=['POST'])
 def api_process_audio():
+    input_path = None
+    converted_path = None
+    diagnostics = {
+        'content_type': request.content_type,
+        'content_length': request.content_length,
+        'is_json': request.is_json,
+        'user_agent': request.user_agent.string if request.user_agent else None,
+    }
     try:
-        print('[API] Request received')
+        print('[API] Request received:', diagnostics)
         if not request.is_json:
-            return jsonify({'error': 'Content-Type harus application/json'}), 400
+            return jsonify({
+                'error': 'Content-Type harus application/json',
+                'stage': 'validate_content_type',
+                'diagnostics': diagnostics
+            }), 400
 
         data = request.get_json()
+        if not isinstance(data, dict):
+            return jsonify({
+                'error': 'Body JSON tidak valid',
+                'stage': 'parse_json',
+                'diagnostics': diagnostics
+            }), 400
+
         audio_data = data.get('audio')
         session_id = data.get('session_id')
+        diagnostics['audio_b64_len'] = len(audio_data) if isinstance(audio_data, str) else 0
 
         if not audio_data:
-            return jsonify({'error': 'Audio data tidak ditemukan'}), 400
+            return jsonify({
+                'error': 'Audio data tidak ditemukan',
+                'stage': 'validate_audio_field',
+                'diagnostics': diagnostics
+            }), 400
 
         if not session_id:
             session_id = uuid.uuid4().hex
             print(f'[API] New session created: {session_id}')
+        diagnostics['session_id'] = session_id
 
         # Ambil history dari database
         history = get_history(session_id)
         chat = model.start_chat(history=history)
+        diagnostics['history_len'] = len(history)
 
         # Simpan file sementara
-        audio_bytes = base64.b64decode(audio_data)
+        try:
+            audio_bytes = base64.b64decode(audio_data, validate=True)
+        except Exception as e:
+            return jsonify({
+                'error': f'Audio base64 tidak valid: {str(e)}',
+                'stage': 'decode_base64',
+                'diagnostics': diagnostics
+            }), 400
+        diagnostics['audio_bytes_len'] = len(audio_bytes)
+
         with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_input:
             temp_input.write(audio_bytes)
             input_path = temp_input.name
 
         # Konversi ke WAV 16kHz mono dengan pydub
         sound = AudioSegment.from_file(input_path)
+        diagnostics['decoded_ms'] = len(sound)
+        diagnostics['decoded_channels'] = sound.channels
+        diagnostics['decoded_frame_rate'] = sound.frame_rate
+        diagnostics['decoded_sample_width'] = sound.sample_width
+
         sound = sound.set_frame_rate(16000).set_channels(1).set_sample_width(2)
         temp_converted = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
         sound.export(temp_converted.name, format="wav")
@@ -256,6 +296,8 @@ def api_process_audio():
         print('[API] Audio converted to 16kHz mono WAV')
         with open(converted_path, 'rb') as f:
             converted_bytes = f.read()
+        diagnostics['converted_bytes_len'] = len(converted_bytes)
+        diagnostics['converted_ms'] = len(sound)
 
         # Kirim ke Google STT
         speech_client = speech.SpeechClient()
@@ -268,13 +310,21 @@ def api_process_audio():
         )
         print('[API] Sending to Google STT...')
         response = speech_client.recognize(config=config, audio=audio)
+        diagnostics['stt_result_count'] = len(response.results)
 
         question = ""
         for result in response.results:
             question += result.alternatives[0].transcript
+        question = question.strip()
+        diagnostics['stt_question_len'] = len(question)
         print('[API] STT result:', question)
         if not question:
-            return jsonify({'error': 'Tidak ada teks yang terdeteksi', 'session_id': session_id}), 400
+            return jsonify({
+                'error': 'Tidak ada teks yang terdeteksi',
+                'stage': 'stt_empty_result',
+                'session_id': session_id,
+                'diagnostics': diagnostics
+            }), 400
 
         # Simpan pertanyaan user ke DB
         save_message(session_id, 'user', question)
@@ -303,12 +353,29 @@ def api_process_audio():
             'question': question,
             'answer': answer,
             'audio_base64': audio_base64,
-            'session_id': session_id
+            'session_id': session_id,
+            'stage': 'ok',
+            'diagnostics': diagnostics
         })
 
     except Exception as e:
         print('[API] ERROR:', str(e))
-        return jsonify({'error': str(e)}), 500
+        return jsonify({
+            'error': str(e),
+            'stage': 'internal_error',
+            'diagnostics': diagnostics
+        }), 500
+    finally:
+        try:
+            if input_path and os.path.exists(input_path):
+                os.remove(input_path)
+        except Exception as cleanup_err:
+            print('[API] cleanup input error:', cleanup_err)
+        try:
+            if converted_path and os.path.exists(converted_path):
+                os.remove(converted_path)
+        except Exception as cleanup_err:
+            print('[API] cleanup converted error:', cleanup_err)
 
 # Endpoint untuk testing API
 @app.route('/api/test', methods=['POST'])
@@ -419,4 +486,3 @@ if __name__ == '__main__':
         main()  # jalankan hanya saat lokal
     else:
         app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
-
