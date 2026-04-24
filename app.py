@@ -39,7 +39,7 @@ if not YOUR_PROJECT_ID:
     raise ValueError("GOOGLE_CLOUD_PROJECT_ID or GCP_PROJECT_ID environment variable must be set")
 
 vertexai.init(project=YOUR_PROJECT_ID, location=YOUR_VERTEX_AI_LOCATION)
-model = GenerativeModel("gemini-2.0-flash")
+model = GenerativeModel("gemini-2.5-flash")
 
 # In-memory session store.
 # WARNING: This is not suitable for production on Cloud Run with multiple
