@@ -1,8 +1,9 @@
 """
-GABRIEL — Cloud Voice API
-Dead simple: receive audio → Gemini → return text
+GABRIEL — Cloud Voice API (OpenRouter + Free STT)
+Dead simple: receive audio → Free Google STT → OpenRouter LLM → return text
 """
 
+import io
 import os
 import struct
 import time
@@ -10,21 +11,30 @@ import time
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
-from google import genai
-from google.genai import types
+import speech_recognition as sr
+from openai import OpenAI
+from pydub import AudioSegment
 
 # ── Config ──────────────────────────────────────────────────
-API_KEY = os.environ.get("GEMINI_API_KEY", "")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 LANGUAGE = os.environ.get("LANGUAGE", "id")
-MODEL = "gemini-2.0-flash"
+# Defaulting to a free model on OpenRouter
+MODEL = os.environ.get("OPENROUTER_MODEL", "google/gemini-2.0-flash-lite-preview-02-05:free")
 
-# ── GenAI Client ────────────────────────────────────────────
+# ── AI Client ────────────────────────────────────────────
 client = None
-if API_KEY:
-    client = genai.Client(api_key=API_KEY)
-    print(f"[OK] Gemini connected with API key, model={MODEL}")
+if OPENROUTER_API_KEY:
+    client = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=OPENROUTER_API_KEY,
+    )
+    print(f"[OK] OpenRouter connected, model={MODEL}")
 else:
-    print("[ERROR] GEMINI_API_KEY not set!")
+    print("[ERROR] OPENROUTER_API_KEY not set!")
+
+# ── STT Engine ──────────────────────────────────────────────
+recognizer = sr.Recognizer()
+stt_lang = "id-ID" if LANGUAGE == "id" else "en-US"
 
 # ── App ─────────────────────────────────────────────────────
 app = FastAPI(title="Gabriel API")
@@ -45,46 +55,50 @@ def wav_header(data_len: int) -> bytes:
     )
 
 
-def ask_gemini_audio(audio_bytes: bytes, mime: str) -> str:
-    """Send audio to Gemini, get text reply."""
-    prompt = (
-        "Listen to this audio and reply to the user. "
-        "Keep it short (max 12 words), engaging, casual English."
-        if LANGUAGE == "en" else
-        "Dengarkan suara ini dan beri balasan langsung ke user. "
-        "Maksimal 12 kata, santai, bahasa Indonesia."
-    )
-    response = client.models.generate_content(
-        model=MODEL,
-        contents=[
-            prompt,
-            types.Part.from_bytes(data=audio_bytes, mime_type=mime),
-        ],
-        config=types.GenerateContentConfig(
-            max_output_tokens=80,
-            temperature=0.9,
-        ),
-    )
-    return (response.text or "").strip() or "Maaf, tidak bisa memproses."
+def audio_to_text(wav_bytes: bytes) -> str:
+    """Convert WAV audio bytes to text using Google Web Speech API."""
+    try:
+        audio_file = io.BytesIO(wav_bytes)
+        with sr.AudioFile(audio_file) as source:
+            audio_data = recognizer.record(source)
+            text = recognizer.recognize_google(audio_data, language=stt_lang)
+            return text
+    except sr.UnknownValueError:
+        return "" # Audio not understood
+    except sr.RequestError as e:
+        print(f"[ERROR] STT Request error: {e}")
+        return ""
+    except Exception as e:
+        print(f"[ERROR] STT error: {e}")
+        return ""
 
 
-def ask_gemini_text(prompt: str) -> str:
-    """Send text to Gemini, get text reply."""
+def ask_llm(prompt: str) -> str:
+    """Send text to OpenRouter, get text reply."""
     system = (
         "You are Gabriel, a friendly AI on a tiny OLED screen. "
         "Keep responses under 15 words."
         if LANGUAGE == "en" else
         "Kamu Gabriel, AI ramah di layar OLED kecil. Jawab maks 15 kata."
     )
-    response = client.models.generate_content(
-        model=MODEL,
-        contents=[f"{system}\n\nUser: {prompt}\nGabriel:"],
-        config=types.GenerateContentConfig(
-            max_output_tokens=80,
+    try:
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=80,
             temperature=0.9,
-        ),
-    )
-    return (response.text or "").strip() or "Maaf, tidak bisa menjawab."
+            extra_headers={
+                "HTTP-Referer": "https://github.com/hidatara-ds/gabriel",
+                "X-Title": "Gabriel Voice Assistant",
+            }
+        )
+        return response.choices[0].message.content.strip() or "Maaf, tidak bisa menjawab."
+    except Exception as e:
+        print(f"[ERROR] LLM Error: {e}")
+        return "Maaf, AI sedang bermasalah."
 
 
 # ═════════════════════════════════════════════════════════════
@@ -96,7 +110,7 @@ async def health():
     return {
         "status": "online",
         "model": MODEL,
-        "api_key_set": bool(API_KEY),
+        "api_key_set": bool(OPENROUTER_API_KEY),
         "language": LANGUAGE,
     }
 
@@ -105,7 +119,7 @@ async def health():
 async def generate(request: Request):
     """Text prompt → AI response."""
     if not client:
-        raise HTTPException(503, "GEMINI_API_KEY not set")
+        raise HTTPException(503, "OPENROUTER_API_KEY not set")
 
     body = await request.json()
     prompt = body.get("prompt", "")
@@ -113,13 +127,13 @@ async def generate(request: Request):
         raise HTTPException(400, "Missing 'prompt'")
 
     try:
-        text = ask_gemini_text(prompt)
+        text = ask_llm(prompt)
         return {
             "message": text,
             "category": "chat",
             "emoji": "💬",
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "source": "gemini",
+            "source": "openrouter",
         }
     except Exception as e:
         print(f"[ERROR] generate: {e}")
@@ -128,9 +142,9 @@ async def generate(request: Request):
 
 @app.post("/api/chat/audio")
 async def audio_chat(request: Request):
-    """Raw PCM from ESP32 → WAV → Gemini → text response."""
+    """Raw PCM from ESP32 → WAV → STT → LLM → text response."""
     if not client:
-        raise HTTPException(503, "GEMINI_API_KEY not set")
+        raise HTTPException(503, "OPENROUTER_API_KEY not set")
 
     pcm = await request.body()
     if not pcm or len(pcm) < 100:
@@ -139,18 +153,38 @@ async def audio_chat(request: Request):
     print(f"[AUDIO] Received {len(pcm)} bytes PCM")
 
     try:
+        # 1. Convert to WAV
         wav = wav_header(len(pcm)) + pcm
         start = time.time()
-        text = ask_gemini_audio(wav, "audio/wav")
-        ms = int((time.time() - start) * 1000)
-        print(f'[OK] Audio response ({ms}ms): "{text}"')
+        
+        # 2. Speech to Text
+        user_text = audio_to_text(wav)
+        ms_stt = int((time.time() - start) * 1000)
+        
+        if not user_text:
+            return {
+                "message": "Maaf, suara kurang jelas." if LANGUAGE == "id" else "Sorry, I couldn't hear that.",
+                "category": "error",
+                "emoji": "🧏",
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "source": "stt",
+            }
+            
+        print(f'[STT] Recognized ({ms_stt}ms): "{user_text}"')
+        
+        # 3. Text to LLM
+        start_llm = time.time()
+        ai_reply = ask_llm(user_text)
+        ms_llm = int((time.time() - start_llm) * 1000)
+        
+        print(f'[LLM] Reply ({ms_llm}ms): "{ai_reply}"')
 
         return {
-            "message": text,
+            "message": ai_reply,
             "category": "chat",
             "emoji": "🗣️",
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "source": "gemini",
+            "source": "openrouter",
         }
     except Exception as e:
         print(f"[ERROR] audio: {e}")
@@ -159,9 +193,9 @@ async def audio_chat(request: Request):
 
 @app.post("/api/chat/audio/web")
 async def audio_chat_web(request: Request):
-    """WebM audio from browser → Gemini → text response."""
+    """WebM audio from browser → WAV → STT → LLM → text response."""
     if not client:
-        raise HTTPException(503, "GEMINI_API_KEY not set")
+        raise HTTPException(503, "OPENROUTER_API_KEY not set")
 
     audio = await request.body()
     if not audio or len(audio) < 100:
@@ -171,17 +205,42 @@ async def audio_chat_web(request: Request):
     print(f"[WEB AUDIO] Received {len(audio)} bytes ({mime})")
 
     try:
+        # 1. Convert WebM to WAV using pydub
         start = time.time()
-        text = ask_gemini_audio(audio, mime)
-        ms = int((time.time() - start) * 1000)
-        print(f'[OK] Web audio response ({ms}ms): "{text}"')
+        audio_stream = io.BytesIO(audio)
+        audio_segment = AudioSegment.from_file(audio_stream)
+        wav_io = io.BytesIO()
+        audio_segment.export(wav_io, format="wav")
+        wav_bytes = wav_io.getvalue()
+        
+        # 2. Speech to Text
+        user_text = audio_to_text(wav_bytes)
+        ms_stt = int((time.time() - start) * 1000)
+        
+        if not user_text:
+            return {
+                "message": "Maaf, suara kurang jelas." if LANGUAGE == "id" else "Sorry, I couldn't hear that.",
+                "category": "error",
+                "emoji": "🧏",
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "source": "stt",
+            }
+            
+        print(f'[STT] Recognized ({ms_stt}ms): "{user_text}"')
+        
+        # 3. Text to LLM
+        start_llm = time.time()
+        ai_reply = ask_llm(user_text)
+        ms_llm = int((time.time() - start_llm) * 1000)
+        
+        print(f'[LLM] Reply ({ms_llm}ms): "{ai_reply}"')
 
         return {
-            "message": text,
+            "message": ai_reply,
             "category": "chat",
             "emoji": "🗣️",
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "source": "gemini",
+            "source": "openrouter",
         }
     except Exception as e:
         print(f"[ERROR] web audio: {e}")
