@@ -416,19 +416,25 @@ def api_process_audio():
         diagnostics['audio_delivery'] = audio_delivery
 
         if include_audio and audio_delivery in ("inline", "url"):
-            synthesize_speech(answer, "temp_response.mp3")
-            with open("temp_response.mp3", "rb") as audio_file:
+            encoding = texttospeech.AudioEncoding.LINEAR16 if is_esp_client else texttospeech.AudioEncoding.MP3
+            suffix = ".wav" if is_esp_client else ".mp3"
+            
+            temp_audio = f"temp_response_{uuid.uuid4().hex}{suffix}"
+            sample_rate_hz = 16000 if is_esp_client else None
+            synthesize_speech(answer, temp_audio, encoding=encoding, sample_rate_hz=sample_rate_hz)
+            with open(temp_audio, "rb") as audio_file:
                 audio_bytes = audio_file.read()
-            os.remove("temp_response.mp3")
+            os.remove(temp_audio)
 
             if audio_delivery == "inline":
                 audio_base64 = base64.b64encode(audio_bytes).decode('utf-8')
                 response_payload['audio_base64'] = audio_base64
             elif audio_delivery == "url":
                 audio_id = uuid.uuid4().hex
+                cache_mime = "audio/wav" if is_esp_client else "audio/mpeg"
                 AUDIO_CACHE[audio_id] = {
                     'bytes': audio_bytes,
-                    'mime': 'audio/mpeg',
+                    'mime': cache_mime,
                     'created_at': datetime.utcnow().isoformat() + 'Z',
                 }
                 # Simple bounded cache
@@ -437,7 +443,9 @@ def api_process_audio():
                     del AUDIO_CACHE[oldest_key]
                 response_payload['audio_id'] = audio_id
                 response_payload['audio_url'] = f"/api/audio/{audio_id}"
-                response_payload['audio_mime'] = "audio/mpeg"
+                # For ESP, we provide WAV (LINEAR16), for others MP3.
+                response_payload['audio_mime'] = "audio/wav" if is_esp_client else "audio/mpeg"
+                response_payload['audio_encoding'] = "LINEAR16" if is_esp_client else "MP3"
 
         diagnostics['is_esp_client'] = is_esp_client
         # Keep ESP responses minimal to avoid JSON parsing/memory issues on device.
@@ -452,6 +460,7 @@ def api_process_audio():
                 minimal_payload['audio_url'] = response_payload['audio_url']
                 minimal_payload['audio_id'] = response_payload.get('audio_id')
                 minimal_payload['audio_mime'] = response_payload.get('audio_mime')
+                minimal_payload['audio_encoding'] = response_payload.get('audio_encoding')
             return jsonify(minimal_payload)
         return jsonify(response_payload)
 
@@ -479,10 +488,11 @@ def get_cached_audio(audio_id):
     audio_item = AUDIO_CACHE.get(audio_id)
     if not audio_item:
         return jsonify({'error': 'Audio tidak ditemukan atau kadaluarsa'}), 404
+    ext = "wav" if audio_item.get('mime') == "audio/wav" else "mp3"
     return Response(
         audio_item['bytes'],
         mimetype=audio_item.get('mime', 'audio/mpeg'),
-        headers={'Content-Disposition': f'inline; filename={audio_id}.mp3'}
+        headers={'Content-Disposition': f'inline; filename={audio_id}.{ext}'}
     )
 
 @app.route('/api/debug/latest-input-meta', methods=['GET'])
@@ -591,7 +601,7 @@ def main():
         except Exception as e:
             print("Gagal:", e)
 
-def synthesize_speech(text, output_path):
+def synthesize_speech(text, output_path, encoding=texttospeech.AudioEncoding.MP3, sample_rate_hz=None):
     client = texttospeech.TextToSpeechClient()
     input_text = texttospeech.SynthesisInput(text=text)
     # Pilih voice yang natural
@@ -600,10 +610,13 @@ def synthesize_speech(text, output_path):
         name="id-ID-Wavenet-A",  # Coba juga id-ID-Wavenet-B, dst
         ssml_gender=texttospeech.SsmlVoiceGender.NEUTRAL
     )
-    audio_config = texttospeech.AudioConfig(
-        audio_encoding=texttospeech.AudioEncoding.MP3,
-        speaking_rate=1.0
-    )
+    audio_kwargs = {
+        "audio_encoding": encoding,
+        "speaking_rate": 1.0
+    }
+    if sample_rate_hz:
+        audio_kwargs["sample_rate_hertz"] = int(sample_rate_hz)
+    audio_config = texttospeech.AudioConfig(**audio_kwargs)
     response = client.synthesize_speech(
         input=input_text, voice=voice, audio_config=audio_config
     )
